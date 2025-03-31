@@ -1,4 +1,7 @@
 # chat_app.py
+import sys
+import pysqlite3
+sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 import os
 import PyPDF2
 from langchain.text_splitter import RecursiveCharacterTextSplitter
