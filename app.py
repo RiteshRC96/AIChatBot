@@ -15,7 +15,13 @@ from chromadb.errors import NotFoundError
 import asyncio
 import sys
 import pysqlite3
-sys.modules["sqlite3"] = pysqlite3
+
+# Attempt to patch system sqlite3 with pysqlite3
+try:
+    import pysqlite3
+    sys.modules["sqlite3"] = pysqlite3
+except ImportError:
+    raise RuntimeError("pysqlite3 is not installed. Make sure it's in requirements.txt")
 
 if sys.platform.startswith('win'):
     try:
