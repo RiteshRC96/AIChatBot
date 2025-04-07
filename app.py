@@ -1,60 +1,58 @@
 # chat_app.py
 import sys
-import pysqlite3
-sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 import os
-import PyPDF2
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+import json
 import chromadb
-import sys
-
-# Try to use pysqlite3 for sqlite3, otherwise fall back to the built-in sqlite3.
-try:
-    import pysqlite3
-    sys.modules["sqlite3"] = pysqlite3
-except ImportError:
-    import sqlite3
-
-
 import streamlit as st
 import numpy as np
 from PyPDF2 import PdfReader
-
+from sentence_transformers import SentenceTransformer, util
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain.schema import HumanMessage, SystemMessage
 from langchain.memory import ConversationBufferMemory
+from chromadb.errors import NotFoundError
+import asyncio
 
-from sentence_transformers import SentenceTransformer, util
+if sys.platform.startswith('win'):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
+
+# --- Load API Key from config.json ---
+def load_api_key(config_path="config.json"):
+    with open(config_path, "r") as file:
+        config = json.load(file)
+    return config.get("GROQ_API_KEY")
+
+GROQ_API_KEY = load_api_key()
+
+# --- Initialize ChromaDB & Embedding Model ---
 chroma_client = chromadb.PersistentClient(path="./chroma_db")
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 try:
     collection = chroma_client.get_collection(name="ai_knowledge_base")
-except chromadb.errors.InvalidCollectionException:
+except NotFoundError:
     collection = chroma_client.create_collection(name="ai_knowledge_base")
 
-# 2. Initialize Embedding Model
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-# 3. Function to Extract Text from PDF
+# --- PDF Text Extraction ---
 def extract_text_from_pdf(pdf_path):
-    """Extract text from a PDF file using PyPDF2."""
     text = ""
     with open(pdf_path, 'rb') as file:
-        reader = PdfReader(file)  # (Correct usage)
+        reader = PdfReader(file)
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
                 text += page_text + "\n"
     return text
 
-# 4. Function to Chunk and Upsert into ChromaDB
+# --- Chunk & Upsert to ChromaDB ---
 def chunk_and_upsert(document_text, chunk_size=200, chunk_overlap=50, batch_size=10):
-    """
-    Split a document into chunks and upsert them into ChromaDB.
-    """
     splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
     chunks = splitter.split_text(document_text)
 
@@ -69,76 +67,48 @@ def chunk_and_upsert(document_text, chunk_size=200, chunk_overlap=50, batch_size
         )
     return f"Upserted {len(chunks)} chunks to the database."
 
-# 5. Main Function to Ingest PDF
+# --- Ingest PDF (only if run directly) ---
 if __name__ == "__main__":
-    pdf_path = "./resume.pdf"  # <-- Make sure the PDF is in the same folder or provide the full path
+    pdf_path = "resume.pdf"
     if not os.path.exists(pdf_path):
         print(f"⚠️ PDF file not found at: {pdf_path}")
     else:
         text = extract_text_from_pdf(pdf_path)
         if text.strip():
-            result = chunk_and_upsert(text, chunk_size=200, chunk_overlap=50)
+            result = chunk_and_upsert(text)
             print(result)
         else:
             print("⚠️ No text found in the PDF!")
 
-# ----------------------------------------------------------------------
-# ✅ Initialize Embeddings & ChromaDB
-
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-
-# ----------------------------------------------------------------------
-# ✅ Initialize Memory & Chat Model
-# ----------------------------------------------------------------------
-memory = ConversationBufferMemory(return_messages=True)  # single memory for the entire conversation
+# --- Initialize Chat Model & Memory ---
+memory = ConversationBufferMemory(return_messages=True)
 semantic_model = SentenceTransformer('all-MiniLM-L6-v2')
-chat = ChatGroq(temperature=0.7, model_name="llama3-70b-8192", groq_api_key="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")
+chat = ChatGroq(temperature=0.7, model_name="llama3-70b-8192", api_key=GROQ_API_KEY)
 
-# ----------------------------------------------------------------------
-# ✅ Streamlit Page Configuration
-# ----------------------------------------------------------------------
+# --- Streamlit Page Config ---
 st.set_page_config(page_title="ChatWithMe", page_icon="🤖", layout="wide")
 st.title("Chat With Ritesh")
 st.write("Your personal chat bot....")
 
-# ----------------------------------------------------------------------
-# ✅ Retrieve Context from ChromaDB
-# ----------------------------------------------------------------------
+# --- Retrieve Context ---
 def retrieve_context(query, top_k=1):
-    """Fetch relevant context for the user query using embeddings and ChromaDB."""
     query_embedding = embedding_model.embed_query(query)
     results = collection.query(query_embeddings=[query_embedding], n_results=top_k)
-    # Return the top document or a fallback message if none is found
     return results.get("documents", [[]])[0] if results else ["No relevant context found."]
 
-# ----------------------------------------------------------------------
-# ✅ Evaluate Response Similarity
-# ----------------------------------------------------------------------
+# --- Evaluate Response Similarity (Optional) ---
 def evaluate_response(user_query, bot_response, context):
-    """Compute similarity between the bot's response and the retrieved context."""
     response_embedding = semantic_model.encode(bot_response, convert_to_tensor=True)
     context_embedding = semantic_model.encode(context, convert_to_tensor=True)
     return util.pytorch_cos_sim(response_embedding, context_embedding)[0][0].item()
 
-# ----------------------------------------------------------------------
-# ✅ Query AI Model
-# ----------------------------------------------------------------------
+# --- Query AI Model ---
 def query_llama3(user_query):
-    """
-    1. Gather system prompt, memory, and new user query.
-    2. Retrieve additional context from ChromaDB.
-    3. Pass all messages to the LLM.
-    4. Return the AI's response.
-    """
-    
-    # System Prompt
     system_prompt = """
 ## **Objective**  
 The chatbot will serve as an interactive assistant based on Ritesh Chougule's background, technical skills, projects, and certifications. It should deliver:
 -Quick, friendly responses for simple queries.
 -In-depth, professional explanations for complex topics, backed by insights from Ritesh’s resume.
-
-
 
 ## **Response Styles**  
 1. **Concise Responses (Simple Queries):**  
@@ -168,60 +138,27 @@ The chatbot will serve as an interactive assistant based on Ritesh Chougule's ba
 - **Behavioral Directives:**  
   - Present yourself as a knowledgeable human expert.  
   - Never break the “no AI disclosure” rule.  
-  - Prioritize user understanding and real-world context.  
-
----
-
-**Usage Example:**  
-1. **Short Query:** “What programming languages does Ritesh know?”  
-   - **Short Answer** (≤6 words, with emojis)  
-2. **Complex Query:** “Tell me more about his advanced projects and how they integrate with cloud platforms.”  
-   - **Detailed Explanation** referencing PDF data, with structured insights and an empathetic tone.
+  - Prioritize user understanding and real-world context.
 """
 
-    # Retrieve relevant context from the knowledge base (optional integration)
     retrieved_context = retrieve_context(user_query)
-    
-    # Prepare the message list:
-    # 1. System prompt
-    # 2. All previous messages from memory
-    # 3. Current user query
     messages = [SystemMessage(content=system_prompt)] + memory.chat_memory.messages + [HumanMessage(content=user_query)]
-    
+
     try:
-        # Get the response from the chat model
         response = chat.invoke(messages)
         return response.content
     except Exception as e:
         return f"⚠️ Error: {str(e)}"
 
-# ----------------------------------------------------------------------
-# ✅ Display Existing Conversation & Accept New User Input
-# ----------------------------------------------------------------------
-
-# Display the conversation stored in memory
+# --- Streamlit Chat UI ---
 for msg in memory.chat_memory.messages:
-    if msg.type == "human":
-        st.chat_message("user").write(msg.content)
-    else:
-        st.chat_message("assistant").write(msg.content)
+    role = "user" if msg.type == "human" else "assistant"
+    st.chat_message(role).write(msg.content)
 
-# Input box for user queries
 user_input = st.chat_input("Type your message...")
 
 if user_input:
-    # 1) Add the user message to memory
     memory.chat_memory.add_user_message(user_input)
-    
-    # 2) Query the model and get the AI response
     ai_response = query_llama3(user_input)
-    
-    # 3) Add the AI response to memory
     memory.chat_memory.add_ai_message(ai_response)
-    
-    # 4) Display the AI's response in the Streamlit interface
     st.chat_message("assistant").write(ai_response)
-    
-    # (Optional) Evaluate response similarity to the retrieved context
-    # context_score = evaluate_response(user_input, ai_response, retrieve_context(user_input))
-    # st.write(f"Context Relevance Score: {context_score:.2f}")
