@@ -1,5 +1,4 @@
 # chat_app.py
-import sys
 import os
 import json
 import chromadb
@@ -14,6 +13,9 @@ from langchain.schema import HumanMessage, SystemMessage
 from langchain.memory import ConversationBufferMemory
 from chromadb.errors import NotFoundError
 import asyncio
+import sys
+import pysqlite3
+sys.modules["sqlite3"] = pysqlite3
 
 if sys.platform.startswith('win'):
     try:
